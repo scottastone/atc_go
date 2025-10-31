@@ -47,6 +47,7 @@ var (
 	styleDebug             = styleDefault.Foreground(tcell.ColorMediumVioletRed)
 	styleCPA               = styleDefault.Foreground(tcell.ColorOrangeRed)
 	stylePredictedConflict = styleDefault.Foreground(tcell.ColorHotPink).Bold(true)
+	styleCommandAck        = styleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack).Bold(true)
 
 	// Airline-specific styles
 	airlineStyles = []tcell.Style{
@@ -128,6 +129,7 @@ type Aircraft struct {
 	isConflicting        bool
 	Speed                float64 // Individual speed multiplier
 	isPredictingConflict bool
+	commandAckTime       float64 // Timer for command acknowledgment flash
 }
 
 // NewAircraft creates a new plane
@@ -160,6 +162,7 @@ func NewAircraft(id rune, callsign string, x, y, alt float64, hdg, targetHdg, ta
 		dx:                   vec.X,     // dx/dy are now floats
 		dy:                   vec.Y,
 		isConflicting:        false,
+		commandAckTime:       0,
 		isPredictingConflict: false,
 	}
 }
@@ -215,6 +218,11 @@ func (a *Aircraft) Update(deltaTime float64) {
 	a.dy = vec.Y
 	a.X += a.dx * BaseSpeed * deltaTime
 	a.Y += a.dy * BaseSpeed * deltaTime
+
+	// Update command ack timer
+	if a.commandAckTime > 0 {
+		a.commandAckTime -= deltaTime
+	}
 
 	// Reset conflict status (will be set by game logic if still true)
 	a.isConflicting = false
@@ -626,6 +634,7 @@ func (g *Game) ProcessCommand() {
 			return
 		}
 		plane.TargetAltitude = value
+		plane.commandAckTime = 2.0 // Flash for 2 seconds
 		g.AddMessage(fmt.Sprintf("%s, new altitude %.0f", callsign, value))
 	case "H": // Heading
 		hdg := int(value)
@@ -634,6 +643,7 @@ func (g *Game) ProcessCommand() {
 			return
 		}
 		plane.TargetHeading = hdg
+		plane.commandAckTime = 2.0 // Flash for 2 seconds
 		g.AddMessage(fmt.Sprintf("%s, new heading %d°", callsign, hdg))
 	default:
 		g.AddMessage("Invalid action. Use 'A' (Altitude) or 'H' (Heading).")
@@ -881,7 +891,10 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 
 	for _, plane := range g.aircraftList {
 		style := plane.BaseStyle // Use the base airline color for the blip
-		if plane.isConflicting {
+		// Order of precedence: Command Ack > Conflict > Predicted Conflict > Base
+		if plane.commandAckTime > 0 {
+			style = styleCommandAck
+		} else if plane.isConflicting {
 			style = styleConflict
 		} else if plane.isPredictingConflict {
 			style = stylePredictedConflict
