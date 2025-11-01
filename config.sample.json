@@ -6,5 +6,7 @@
   "max_aircraft": 15,     // The maximum number of aircraft allowed in the airspace at one time.
   "spawn_rate": 1.0,      // The base time (in seconds) between new aircraft spawns. Lower is faster/harder.
   "base_speed": 0.125,    // The base speed of aircraft in "units" per second. Higher is faster.
-  "flow_traffic_proportion": 0.7 // The proportion (0.0 to 1.0) of aircraft that spawn on a predictable path.
+  "flow_traffic_proportion": 0.7, // The proportion (0.0 to 1.0) of aircraft that spawn on a predictable path.
+  "sim_rate_hz": 60,      // The number of simulation updates per second.
+  "render_rate_hz": 30    // The target frames per second (FPS) for rendering.
 }

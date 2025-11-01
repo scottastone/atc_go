@@ -303,6 +303,8 @@ type Game struct {
 	spawnRateSetting             float64
 	baseSpeedSetting             float64
 	flowTrafficProportionSetting float64
+	simRateHz                    int
+	renderRateHz                 int
 } // Added closing brace
 
 var airlineCodes = []string{"ACA", "DAL", "UAL", "AAL", "SWA", "BAW", "AFR", "KLM", "JAL", "DLH", "QFA"}
@@ -368,6 +370,8 @@ func NewGame(s tcell.Screen, apiEnabled bool) *Game {
 		spawnRateSetting:             1.0,
 		baseSpeedSetting:             0.125,
 		flowTrafficProportionSetting: 0.7, // 70% of traffic will be in a predictable flow
+		simRateHz:                    60,
+		renderRateHz:                 30,
 	}
 	g.updateScreenSize() // Set initial size
 	return g
@@ -916,12 +920,15 @@ func (g *Game) handlePauseMenu() {
 
 // Run is the main game loop
 func (g *Game) Run() {
+	simRate := time.Second / time.Duration(g.simRateHz)
+	renderRate := time.Second / time.Duration(g.renderRateHz)
+
 	// Start the input handler in a goroutine
 	go g.HandleInput()
 
 	// Start the game logic ticker in a goroutine
-	g.simTicker = time.NewTicker(SimRate)
-	g.renderTicker = time.NewTicker(RenderRate)
+	g.simTicker = time.NewTicker(simRate)
+	g.renderTicker = time.NewTicker(renderRate)
 
 	for g.gameRunning {
 		select {
@@ -1469,10 +1476,13 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 	// 10. Draw DEBUG overlay
 	g.renderTime = time.Since(start) // Store render time
 	if g.showDebug {
+		fps := 1.0 / g.renderTime.Seconds()
 		debugStr1 := fmt.Sprintf("SimTime: %s", g.simTime)
 		debugStr2 := fmt.Sprintf("RenderTime: %s", g.renderTime)
-		DrawText(g.screen, g.airspaceWidth-len(debugStr1)-2, g.airspaceHeight-3, debugStr1, styleDebug)
-		DrawText(g.screen, g.airspaceWidth-len(debugStr2)-2, g.airspaceHeight-2, debugStr2, styleDebug)
+		debugStr3 := fmt.Sprintf("FPS: %.1f", fps)
+		DrawText(g.screen, g.airspaceWidth-len(debugStr1)-2, g.airspaceHeight-4, debugStr1, styleDebug)
+		DrawText(g.screen, g.airspaceWidth-len(debugStr2)-2, g.airspaceHeight-3, debugStr2, styleDebug)
+		DrawText(g.screen, g.airspaceWidth-len(debugStr3)-2, g.airspaceHeight-2, debugStr3, styleDebug)
 	}
 
 	// 11. Push buffer to screen
@@ -1566,10 +1576,12 @@ func (g *Game) commandHandler(w http.ResponseWriter, r *http.Request) {
 
 // GameConfig defines the structure for a settings file.
 type GameConfig struct {
-	MaxAircraft int     `json:"max_aircraft"`
-	SpawnRate   float64 `json:"spawn_rate"`
-	BaseSpeed   float64 `json:"base_speed"`
-	FlowTraffic float64 `json:"flow_traffic_proportion"`
+	MaxAircraft  int     `json:"max_aircraft"`
+	SpawnRate    float64 `json:"spawn_rate"`
+	BaseSpeed    float64 `json:"base_speed"`
+	FlowTraffic  float64 `json:"flow_traffic_proportion"`
+	SimRateHz    int     `json:"sim_rate_hz"`
+	RenderRateHz int     `json:"render_rate_hz"`
 }
 
 // loadConfig reads a JSON file and returns a GameConfig struct.
@@ -1622,6 +1634,12 @@ func main() {
 			game.spawnRateSetting = config.SpawnRate
 			game.baseSpeedSetting = config.BaseSpeed
 			game.flowTrafficProportionSetting = config.FlowTraffic
+			if config.SimRateHz > 0 {
+				game.simRateHz = config.SimRateHz
+			}
+			if config.RenderRateHz > 0 {
+				game.renderRateHz = config.RenderRateHz
+			}
 			fmt.Printf("Loaded settings from %s\n", configFile)
 		}
 	}
