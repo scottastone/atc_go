@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
@@ -1549,12 +1550,39 @@ func (g *Game) commandHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Command received: %s", req.Command)
 }
 
+// GameConfig defines the structure for a settings file.
+type GameConfig struct {
+	MaxAircraft int     `json:"max_aircraft"`
+	SpawnRate   float64 `json:"spawn_rate"`
+	BaseSpeed   float64 `json:"base_speed"`
+}
+
+// loadConfig reads a JSON file and returns a GameConfig struct.
+func loadConfig(path string) (*GameConfig, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	config := &GameConfig{}
+	err = decoder.Decode(config)
+	if err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
 // --- Main Function ---
 func main() {
-	apiEnabled := false
-	if len(os.Args) > 1 && os.Args[1] == "-api" {
-		apiEnabled = true
-	}
+	var apiEnabled bool
+	var apiPort int
+	var configFile string
+	flag.BoolVar(&apiEnabled, "api", false, "Enable the HTTP API server on :8080.")
+	flag.StringVar(&configFile, "config", "", "Path to a JSON configuration file.")
+	flag.IntVar(&apiPort, "port", 8080, "Port for the HTTP API server.")
+	flag.Parse()
 
 	s, err := tcell.NewScreen()
 	if err != nil {
@@ -1570,12 +1598,25 @@ func main() {
 	game := NewGame(s, apiEnabled)
 	defer s.Fini()
 
+	if configFile != "" {
+		config, err := loadConfig(configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not load config file '%s': %v\n", configFile, err)
+		} else {
+			game.maxAircraftSetting = config.MaxAircraft
+			game.spawnRateSetting = config.SpawnRate
+			game.baseSpeedSetting = config.BaseSpeed
+			fmt.Printf("Loaded settings from %s\n", configFile)
+		}
+	}
+
 	if apiEnabled {
+		address := fmt.Sprintf(":%d", apiPort)
 		http.HandleFunc("/state", game.stateHandler)
 		http.HandleFunc("/command", game.commandHandler)
 		go func() {
-			fmt.Println("API server starting on :8080")
-			http.ListenAndServe(":8080", nil)
+			fmt.Printf("API server starting on %s\n", address)
+			http.ListenAndServe(address, nil)
 		}()
 	}
 

@@ -41,6 +41,36 @@ Go ATC Simulator is a terminal-based Air Traffic Control (ATC) game written in G
     ./atc_go
     ```
 
+#### Command-line Flags
+
+The game supports several command-line flags for advanced configuration:
+
+*   `-api`: Enables a web server for remote control and state observation, useful for reinforcement learning agents. By default, it uses port `8080`.
+    *   `GET /state`: Returns a JSON object of the current game state.
+    *   `POST /command`: Accepts a JSON object like `{"command": "DAL123 H 270"}` to issue commands.
+
+*   `-config [path]`: Loads game settings from a specified JSON file. This allows you to create and use different scenarios easily.
+
+*   `-port [number]`: Specifies the port for the API server (e.g., `-port 8081`).
+
+**Example Usage:**
+```sh
+# Run with a custom configuration file
+./atc_go -config config.sample.json
+
+# Run with both the API and a config file
+./atc_go -api -config my_scenario.json -port 8081
+```
+
+A sample configuration file (`config.sample.json`) is included in the repository. It looks like this:
+```json
+{
+  "max_aircraft": 15,
+  "spawn_rate": 1.0,
+  "base_speed": 0.125
+}
+```
+
 ## How to Play
 
 ### The Objective
@@ -62,15 +92,14 @@ The screen is divided into four main areas:
 
 ### Controls & Commands
 
-#### Game Controls
+#### General Controls
 
 | Key         | Action                               |
 |-------------|--------------------------------------|
+| `ESC`       | Open Pause Menu (Resume, Restart, Quit) |
 | `+`         | Increase simulation speed (up to 4x) |
 | `-`         | Decrease simulation speed (down to 0.5x) |
-| `ESC`       | Pause or resume the simulation       |
 | `Ctrl+D`    | Toggle debug information overlay     |
-| `q` (empty) | Quit the game                        |
 | `Ctrl+C`    | Force quit the game                  |
 
 #### Aircraft Commands
@@ -78,12 +107,13 @@ The screen is divided into four main areas:
 All aircraft commands follow the format: `[CALLSIGN] [ACTION] [VALUE]`
 
 *   **CALLSIGN:** The 3-letter, 3-digit identifier for the aircraft (e.g., `DAL123`, `SWA456`).
-*   **ACTION:** `H` for Heading or `A` for Altitude.
+*   **ACTION:** `H` for Heading, `A` for Altitude, or `HO` for Handoff.
 *   **VALUE:** The numerical value for the new heading or altitude.
 
 **Examples:**
 *   `AAL456 H 270` - Orders American 456 to turn to a heading of 270 degrees.
-*   `BAW789 A 25000` - Orders British Airways 789 to climb/descend to 25,000 feet.
+*   `b A 25000` - Orders aircraft `b` to climb/descend to 25,000 feet.
+*   `HO UAL123` - Hands off United 123, removing it from the screen and awarding points.
 
 ### Understanding the Display
 
@@ -109,4 +139,3 @@ All aircraft commands follow the format: `[CALLSIGN] [ACTION] [VALUE]`
     *   `Hdg`: Current heading and (Target) heading.
     *   `Alt`: Current altitude and (Target) altitude.
     *   `STATUS`: The aircraft's current action (`CRUISING`, `CLIMBING`, `DESCENDING`, or `**CONFLICT**`). The color of this text also indicates its status.
-
