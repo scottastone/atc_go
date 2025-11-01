@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -19,9 +21,9 @@ const (
 	FooterHeight      = 10               // Height of the log/input/help area
 	SimRate           = time.Second / 60 // 60Hz simulation update rate
 	RenderRate        = time.Second / 30 // 30Hz render update rate
-	BaseSpeed         = 0.25             // "Units" per second at 1x speed. Slower for more realism.
-	TurnRate          = 15.0             // Degrees per second. A 90-degree turn now takes 6 seconds.
-	AltitudeRate      = 100.0            // Feet per second. A 1000ft change takes 10 seconds.
+	BaseSpeed         = 0.125            // "Units" per second at 1x speed. Slower for more realism.
+	TurnRate          = 10.0             // Degrees per second. A 90-degree turn now takes 9 seconds.
+	AltitudeRate      = 50.0             // Feet per second. A 1000ft change takes 20 seconds.
 	AltitudeMin       = 10000.0
 	AltitudeMax       = 30000.0
 	VerticalSep       = 1000.0 // Minimum vertical separation (float)
@@ -48,6 +50,7 @@ var (
 	styleCPA               = styleDefault.Foreground(tcell.ColorOrangeRed)
 	stylePredictedConflict = styleDefault.Foreground(tcell.ColorHotPink).Bold(true)
 	styleCommandAck        = styleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack).Bold(true)
+	styleSelected          = styleDefault.Background(tcell.ColorDarkSlateGray)
 
 	// Airline-specific styles
 	airlineStyles = []tcell.Style{
@@ -74,19 +77,8 @@ const (
 	StatePlaying
 	StatePaused
 	StateGameOver
+	StateGameOverPending // New state for the grace period
 )
-
-type Difficulty struct {
-	Name        string
-	MaxAircraft int
-	SpawnRate   float64 // Base spawn time, lower is faster
-}
-
-var difficulties = []Difficulty{
-	{Name: "Easy", MaxAircraft: 8, SpawnRate: 2.0},
-	{Name: "Normal", MaxAircraft: 15, SpawnRate: 1.0},
-	{Name: "Hard", MaxAircraft: 25, SpawnRate: 0.5},
-}
 
 // PredictedConflict stores information about a potential future conflict.
 type PredictedConflict struct {
@@ -115,25 +107,28 @@ func headingToVector(hdg int) Vector {
 
 // Aircraft represents a single blip
 type Aircraft struct {
-	ID                   rune // Unique character for the blip
-	Callsign             string
-	X, Y                 float64 // Position is now float64
-	Altitude             float64 // Altitude is now float64
-	Heading              int
-	TargetAltitude       float64 // Target altitude is now float64
-	TargetHeading        int
-	Status               string
+	ID                   rune        `json:"id"`
+	Callsign             string      `json:"callsign"`
+	X                    float64     `json:"x"`
+	Y                    float64     `json:"y"`
+	Altitude             float64     `json:"altitude"`
+	Heading              float64     `json:"heading"`
+	TargetAltitude       float64     `json:"target_altitude"`
+	TargetHeading        float64     `json:"target_heading"`
+	Status               string      `json:"status"`
 	StatusStyle          tcell.Style // Color of the status line (changes with status)
 	BaseStyle            tcell.Style // Base color of the airline (for the blip)
-	dx, dy               float64     // Movement vector is now float64
+	dx, dy               float64     // Movement vector is now float64 (internal)
 	isConflicting        bool
-	Speed                float64 // Individual speed multiplier
 	isPredictingConflict bool
 	commandAckTime       float64 // Timer for command acknowledgment flash
+	commandHistory       []string
+	turnRate             float64 // Degrees per second, per-aircraft
+	altitudeRate         float64 // Feet per second, per-aircraft
 }
 
 // NewAircraft creates a new plane
-func NewAircraft(id rune, callsign string, x, y, alt float64, hdg, targetHdg, targetAlt float64) *Aircraft {
+func NewAircraft(id rune, callsign string, x, y, alt, hdg, targetHdg, targetAlt float64) *Aircraft {
 	vec := headingToVector(int(hdg))
 
 	// Find airline index to get consistent color
@@ -147,31 +142,44 @@ func NewAircraft(id rune, callsign string, x, y, alt float64, hdg, targetHdg, ta
 	}
 	baseStyle := airlineStyles[colorIndex%len(airlineStyles)] // Use modulo for safety
 
+	// Add some variability to performance
+	// Turn rate: +/- 10% of base
+	// Altitude rate: +/- 15% of base
+	turnRateVar := (rand.Float64() - 0.5) * 0.2 * TurnRate    // rand between -0.1 and +0.1
+	altRateVar := (rand.Float64() - 0.5) * 0.3 * AltitudeRate // rand between -0.15 and +0.15
+
 	return &Aircraft{
 		ID:                   id,
 		Callsign:             callsign,
 		X:                    x,
 		Y:                    y,
 		Altitude:             alt,
-		Heading:              int(hdg),
+		Heading:              hdg,
 		TargetAltitude:       targetAlt,
-		TargetHeading:        int(targetHdg),
+		TargetHeading:        targetHdg,
 		Status:               "CRUISING",
 		StatusStyle:          baseStyle, // Cruising style is base style
 		BaseStyle:            baseStyle, // Store base style
 		dx:                   vec.X,     // dx/dy are now floats
 		dy:                   vec.Y,
 		isConflicting:        false,
-		commandAckTime:       0,
 		isPredictingConflict: false,
+		turnRate:             TurnRate + turnRateVar,
+		altitudeRate:         AltitudeRate + altRateVar,
+		commandHistory:       make([]string, 0),
 	}
 }
 
 // Update ticks the aircraft's logic, takes deltaTime
-func (a *Aircraft) Update(deltaTime float64) {
+func (a *Aircraft) Update(deltaTime float64, baseSpeed float64) {
+	// 1. Update Position based on heading from *last* tick to create an arc.
+	// The movement vector (dx, dy) is based on the heading before it's updated.
+	a.X += a.dx * baseSpeed * deltaTime
+	a.Y += a.dy * baseSpeed * deltaTime
+
 	// 1. Update Altitude
 	altDiff := a.TargetAltitude - a.Altitude
-	altStep := AltitudeRate * deltaTime
+	altStep := a.altitudeRate * deltaTime
 	if math.Abs(altDiff) < altStep {
 		a.Altitude = a.TargetAltitude
 	} else if altDiff > 0 {
@@ -191,9 +199,9 @@ func (a *Aircraft) Update(deltaTime float64) {
 
 	// 2. Update Heading (now with turn rate)
 	if a.Heading != a.TargetHeading {
-		turnStep := TurnRate * deltaTime // Degrees to turn this tick
+		turnStep := a.turnRate * deltaTime // Degrees to turn this tick
 
-		// Calculate shortest turn direction
+		// Calculate shortest turn direction (float64)
 		diff := a.TargetHeading - a.Heading
 		if diff > 180 {
 			diff -= 360
@@ -201,23 +209,21 @@ func (a *Aircraft) Update(deltaTime float64) {
 			diff += 360
 		}
 
-		if math.Abs(float64(diff)) < turnStep {
+		if math.Abs(diff) < turnStep {
 			a.Heading = a.TargetHeading // Snap to target
 		} else if diff > 0 {
 			// Turn right (clockwise)
-			a.Heading = (a.Heading + int(turnStep)) % 360
+			a.Heading += turnStep
 		} else {
 			// Turn left (counter-clockwise)
-			a.Heading = (a.Heading - int(turnStep) + 360) % 360
+			a.Heading -= turnStep
 		}
+		a.Heading = math.Mod(a.Heading+360, 360) // Normalize to 0-359
 	}
 
-	// 3. Update Position based on *current* heading
-	vec := headingToVector(a.Heading)
-	a.dx = vec.X
-	a.dy = vec.Y
-	a.X += a.dx * BaseSpeed * deltaTime
-	a.Y += a.dy * BaseSpeed * deltaTime
+	// 3. Update movement vector for the *next* tick based on the *new* heading.
+	vec := headingToVector(int(a.Heading)) // Recalculate vector from current heading
+	a.dx, a.dy = vec.X, vec.Y              // Update the movement vector
 
 	// Update command ack timer
 	if a.commandAckTime > 0 {
@@ -239,38 +245,62 @@ func (a *Aircraft) GetStatusLine() (string, tcell.Style) {
 	}
 
 	// Format: ID CALLSIGN | Pos: (XX.X, YY.X) | Hdg: XXX° (Tgt: XXX°) | Alt: XXXXX (Tgt: XXXXX) | STATUS
-	line := fmt.Sprintf("%c %-7s| Pos:(%4.1f,%4.1f) | Hdg:%3d°(Tgt:%3d°) | Alt:%5.0f(Tgt:%5.0f) | %s",
+	line := fmt.Sprintf("%c %-7s| Pos:(%4.1f,%4.1f) | Hdg:%3.0f°(Tgt:%3.0f°) | Alt:%5.0f(Tgt:%5.0f) | %s",
 		a.ID, a.Callsign, a.X, a.Y, a.Heading, a.TargetHeading, a.Altitude, a.TargetAltitude, status)
 	return line, style
 }
 
+// addCommandToHistory adds a command string to the aircraft's history, keeping it to a max length.
+func (a *Aircraft) addCommandToHistory(cmd string) {
+	const maxHistory = 5
+	a.commandHistory = append(a.commandHistory, cmd)
+	if len(a.commandHistory) > maxHistory {
+		a.commandHistory = a.commandHistory[len(a.commandHistory)-maxHistory:]
+	}
+}
+
+func (a *Aircraft) IsCommandAck() bool {
+	return a.commandAckTime > 0
+}
+
 // Game holds the entire simulation state
 type Game struct {
-	state              GameState
-	difficulty         Difficulty
-	screen             tcell.Screen
-	aircraftList       []*Aircraft
-	gameRunning        bool
-	showDebug          bool
-	spawnTimer         float64 // Now float64
-	score              int
-	conflicts          int
-	commandInput       string
-	messageLog         []string
-	mutex              sync.Mutex
-	airspaceWidth      int
-	airspaceHeight     int
-	r                  *rand.Rand
-	speedMultiplier    float64      // Now float64
-	simTicker          *time.Ticker // For simulation logic
-	renderTicker       *time.Ticker // For drawing
-	nextAircraftID     rune
-	conflictFlash      bool
-	simTime            time.Duration
-	renderTime         time.Duration
-	predictedConflicts []*PredictedConflict
-	menuSelection      int // 0 for Restart, 1 for Quit
-	actionChan         chan string
+	state                     GameState
+	screen                    tcell.Screen
+	aircraftList              []*Aircraft
+	gameRunning               bool
+	showDebug                 bool
+	spawnTimer                float64 // Now float64
+	score                     int
+	conflicts                 int
+	commandInput              string
+	messageLog                []string
+	commandHistory            []string // For command history
+	historyIndex              int      // For command history
+	mutex                     sync.Mutex
+	airspaceWidth             int
+	airspaceHeight            int
+	r                         *rand.Rand
+	speedMultiplier           float64      // Now float64
+	simTicker                 *time.Ticker // For simulation logic
+	renderTicker              *time.Ticker // For drawing
+	nextAircraftID            rune
+	conflictFlash             bool
+	simTime                   time.Duration
+	renderTime                time.Duration
+	predictedConflicts        []*PredictedConflict
+	menuSelection             int // 0 for Restart, 1 for Quit
+	pauseMenuSelection        int // For the pause menu
+	gameOverTimer             float64
+	selectedAircraftCallsign  string // For highlighting in status board
+	tabCompletionPrefix       string // To remember the original prefix for cycling
+	tabCompletionStartedEmpty bool   // To handle cycling when starting with an empty input
+	actionChan                chan string
+	apiEnabled                bool
+	// Settings
+	maxAircraftSetting int
+	spawnRateSetting   float64
+	baseSpeedSetting   float64
 } // Added closing brace
 
 var airlineCodes = []string{"ACA", "DAL", "UAL", "AAL", "SWA", "BAW", "AFR", "KLM", "JAL", "DLH", "QFA"}
@@ -287,37 +317,54 @@ func (g *Game) Reset() {
 	defer g.mutex.Unlock()
 
 	g.aircraftList = []*Aircraft{}
-	g.state = StatePlaying
-	g.spawnTimer = g.difficulty.SpawnRate * 2
+	g.spawnTimer = g.spawnRateSetting * 2
 	g.score = 0
 	g.conflicts = 0
 	g.commandInput = ""
 	g.messageLog = make([]string, 5)
+	g.commandHistory = []string{}
+	g.historyIndex = -1
 	g.r = rand.New(rand.NewSource(time.Now().UnixNano()))
 	g.speedMultiplier = 1.0 // Reset to 1x on new game
 	g.nextAircraftID = 'a'
 	g.predictedConflicts = make([]*PredictedConflict, 0)
 	g.menuSelection = 0
+	g.pauseMenuSelection = 0
+	g.gameOverTimer = 0
+	g.tabCompletionPrefix = ""
+	g.tabCompletionStartedEmpty = false
+	g.selectedAircraftCallsign = ""
 }
 
 // NewGame initializes the game
-func NewGame(s tcell.Screen) *Game {
+func NewGame(s tcell.Screen, apiEnabled bool) *Game {
 	g := &Game{
-		screen:             s,
-		state:              StateMenu,
-		difficulty:         difficulties[1], // Default to Normal
-		aircraftList:       []*Aircraft{},
-		gameRunning:        true,
-		showDebug:          false,
-		spawnTimer:         2.5, // float64 (start spawning sooner)
-		messageLog:         make([]string, 5),
-		r:                  rand.New(rand.NewSource(time.Now().UnixNano())),
-		speedMultiplier:    1.0, // float64, start at 1x
-		nextAircraftID:     'a',
-		conflictFlash:      false,
-		predictedConflicts: make([]*PredictedConflict, 0),
-		menuSelection:      0,
-		actionChan:         make(chan string, 1),
+		screen:                    s,
+		state:                     StateMenu,
+		aircraftList:              []*Aircraft{},
+		gameRunning:               true,
+		showDebug:                 false,
+		spawnTimer:                2.5, // float64 (start spawning sooner)
+		messageLog:                make([]string, 5),
+		commandHistory:            []string{},
+		historyIndex:              -1,
+		r:                         rand.New(rand.NewSource(time.Now().UnixNano())),
+		speedMultiplier:           1.0, // float64, start at 1x
+		nextAircraftID:            'a',
+		conflictFlash:             false,
+		predictedConflicts:        make([]*PredictedConflict, 0),
+		menuSelection:             0,
+		pauseMenuSelection:        0,
+		gameOverTimer:             0,
+		tabCompletionPrefix:       "",
+		tabCompletionStartedEmpty: false,
+		selectedAircraftCallsign:  "",
+		actionChan:                make(chan string, 1),
+		apiEnabled:                apiEnabled,
+		// Default settings (Normal)
+		maxAircraftSetting: 15,
+		spawnRateSetting:   1.0,
+		baseSpeedSetting:   0.125,
 	}
 	g.updateScreenSize() // Set initial size
 	return g
@@ -352,9 +399,33 @@ func (g *Game) getRandomAltitude() float64 {
 	return commonAltitudes[g.r.Intn(len(commonAltitudes))]
 }
 
+// isSpawnLocationSafe checks if a new aircraft at (x, y, alt) would conflict with existing aircraft.
+func (g *Game) isSpawnLocationSafe(x, y, alt float64) bool {
+	for _, plane := range g.aircraftList {
+		latDist := math.Sqrt(math.Pow(plane.X-x, 2) + math.Pow(plane.Y-y, 2))
+		vertDist := math.Abs(plane.Altitude - alt)
+
+		if latDist < LateralSep && vertDist < VerticalSep {
+			return false // Conflict detected
+		}
+	}
+	return true // Location is safe
+}
+
 // GenerateAircraft creates a new plane at a random edge
 func (g *Game) GenerateAircraft() {
-	// 1. Generate random callsign
+	// Try up to 10 times to find a safe spawn location to prevent infinite loops
+	for i := 0; i < 10; i++ {
+		if g.tryGenerateAircraft() {
+			return // Successfully generated
+		}
+	}
+	// If we failed 10 times, log it and give up for this cycle.
+	g.AddMessage("Failed to find safe spawn point.")
+}
+
+// tryGenerateAircraft attempts to create a single aircraft. Returns true on success.
+func (g *Game) tryGenerateAircraft() bool {
 	airline := airlineCodes[g.r.Intn(len(airlineCodes))]
 	flightNum := g.r.Intn(900) + 100 // e.g., 100-999
 	callsign := fmt.Sprintf("%s%d", airline, flightNum)
@@ -380,8 +451,22 @@ func (g *Game) GenerateAircraft() {
 		heading = 270
 	}
 
+	// Check if this spawn point is safe. If not, abort this attempt.
+	if !g.isSpawnLocationSafe(x, y, altitude) {
+		// This location is not safe, try again.
+		return false
+	}
+
 	// Give it a new random target heading and altitude to create action
-	newTargetHeading := g.r.Intn(360)
+	var newTargetHeading float64
+	if g.r.Float64() < 0.5 {
+		// 50% chance to fly straight initially
+		newTargetHeading = float64(heading)
+	} else {
+		// 50% chance to get a new heading
+		newTargetHeading = float64(g.r.Intn(360))
+	}
+
 	newTargetAltitude := g.getRandomAltitude()
 	// Ensure new altitude is different
 	for newTargetAltitude == altitude {
@@ -397,11 +482,12 @@ func (g *Game) GenerateAircraft() {
 		g.nextAircraftID = 'a' // Skip over symbols between '9' and 'a'
 	}
 
-	newPlane := NewAircraft(id, callsign, x, y, altitude, float64(heading), float64(newTargetHeading), newTargetAltitude)
+	newPlane := NewAircraft(id, callsign, x, y, altitude, float64(heading), newTargetHeading, newTargetAltitude)
 
 	g.aircraftList = append(g.aircraftList, newPlane)
-	g.AddMessage(fmt.Sprintf("New(%c): %s, Hdg %d° Alt %.0f, Tgt Hdg %d° Tgt Alt %.0f",
+	g.AddMessage(fmt.Sprintf("New(%c): %s, Hdg %d° Alt %.0f, Tgt Hdg %.0f° Tgt Alt %.0f",
 		id, callsign, heading, altitude, newTargetHeading, newTargetAltitude))
+	return true
 }
 
 // FindAircraft looks up a plane by its callsign
@@ -412,6 +498,29 @@ func (g *Game) FindAircraft(callsign string) *Aircraft {
 		}
 	}
 	return nil
+}
+
+// FindAircraftByIdentifier looks up a plane by its callsign or its single-character ID.
+func (g *Game) FindAircraftByIdentifier(identifier string) *Aircraft {
+	// The input identifier is already uppercased.
+
+	// Try to find by single-character ID first.
+	if len(identifier) == 1 {
+		idRune := rune(identifier[0])
+		// Convert uppercase letter from command to lowercase for matching.
+		if idRune >= 'A' && idRune <= 'Z' {
+			idRune = idRune - 'A' + 'a'
+		}
+
+		for _, plane := range g.aircraftList {
+			if plane.ID == idRune {
+				return plane
+			}
+		}
+	}
+
+	// If not found by ID, fall back to searching by full callsign.
+	return g.FindAircraft(identifier)
 }
 
 // CheckForConflicts iterates all pairs and flags conflicts
@@ -534,24 +643,29 @@ func (g *Game) UpdateSimulation(deltaTime float64) {
 
 	// Check if paused
 	switch g.state {
-	case StatePlaying:
-		// Continue
+	case StatePlaying, StateGameOverPending: // Allow simulation to run in both states
+		if g.state == StateGameOverPending {
+			g.gameOverTimer -= deltaTime
+			if g.gameOverTimer <= 0 {
+				g.state = StateGameOver // Transition to the final game over screen
+			}
+		}
 	default:
-		// Any other state (Paused, Menu, GameOver), do nothing.
+		// Any other state (Paused, Menu, final GameOver), do not update simulation.
 		return
 	}
 
 	// 1. Spawn new aircraft
 	g.spawnTimer -= deltaTime
-	if len(g.aircraftList) < g.difficulty.MaxAircraft && g.spawnTimer <= 0 {
+	if len(g.aircraftList) < g.maxAircraftSetting && g.spawnTimer <= 0 {
 		g.GenerateAircraft()
-		g.spawnTimer = g.r.Float64()*2.0 + g.difficulty.SpawnRate
+		g.spawnTimer = g.r.Float64()*2.0 + g.spawnRateSetting
 	}
 
 	// 2. Update all aircraft
 	var planesToKeep []*Aircraft
 	for _, plane := range g.aircraftList {
-		plane.Update(deltaTime)
+		plane.Update(deltaTime, g.baseSpeedSetting)
 		// Check if plane has left the airspace (use int cast for grid boundary)
 		if int(plane.X) > 0 && int(plane.X) < g.airspaceWidth-1 && int(plane.Y) > 0 && int(plane.Y) < g.airspaceHeight-1 {
 			planesToKeep = append(planesToKeep, plane)
@@ -587,21 +701,20 @@ func (g *Game) UpdateSimulation(deltaTime float64) {
 	}
 
 	// 5. Check for game over
-	if g.conflicts > GameOverConflict {
-		g.state = StateGameOver
+	// Only trigger this once, when moving from Playing state
+	if g.conflicts > GameOverConflict && g.state == StatePlaying {
+		g.state = StateGameOverPending
+		g.gameOverTimer = 4.0 // 4-second grace period
 	}
 
 	// Store sim time for debug
 	g.simTime = time.Since(start)
 }
 
-// ProcessCommand parses and executes user input
-func (g *Game) ProcessCommand() {
-	g.mutex.Lock()
-	defer g.mutex.Unlock()
-
-	command := strings.TrimSpace(g.commandInput)
-	g.commandInput = "" // Clear input buffer
+// ProcessCommand parses and executes a command string.
+// It's now separate from UI input handling so it can be called by the API.
+func (g *Game) ProcessCommand(command string) {
+	command = strings.TrimSpace(command)
 
 	if command == "" {
 		return
@@ -609,15 +722,117 @@ func (g *Game) ProcessCommand() {
 
 	cmdUpper := strings.ToUpper(command)
 	parts := strings.Split(cmdUpper, " ")
+
+	// Handle single-word commands first
+	if len(parts) == 1 {
+		switch cmdUpper {
+		case "ALTCHK":
+			altGroups := make(map[int][]string)
+			// Group by truncating to the nearest 1000ft level to catch conflicts.
+			for _, plane := range g.aircraftList {
+				roundedAlt := int(plane.Altitude/1000) * 1000
+				altGroups[roundedAlt] = append(altGroups[roundedAlt], plane.Callsign)
+			}
+
+			found := false
+			for alt, callsigns := range altGroups {
+				if len(callsigns) > 1 {
+					g.AddMessage(fmt.Sprintf("ALT %d: %s", alt, strings.Join(callsigns, ", ")))
+					found = true
+				}
+			}
+			if !found {
+				g.AddMessage("No aircraft sharing altitudes.")
+			}
+			return
+
+		case "HDGCHK":
+			hdgGroups := make(map[int][]string)
+			// Group by rounding to the nearest 10 degrees.
+			for _, plane := range g.aircraftList {
+				// Round to nearest 10, e.g., 273 -> 270, 278 -> 280
+				roundedHdg := int(math.Round(plane.Heading/10.0)) * 10
+				// Handle the 355-359 range rounding to 360
+				if roundedHdg == 360 {
+					roundedHdg = 0
+				}
+				hdgGroups[roundedHdg] = append(hdgGroups[roundedHdg], plane.Callsign)
+			}
+
+			found := false
+			for hdg, callsigns := range hdgGroups {
+				if len(callsigns) > 1 {
+					g.AddMessage(fmt.Sprintf("HDG %d°: %s", hdg, strings.Join(callsigns, ", ")))
+					found = true
+				}
+			}
+			if !found {
+				g.AddMessage("No aircraft on similar headings.")
+			}
+			return
+
+		case "HELP":
+			g.AddMessage("--- HELP ---")
+			g.AddMessage("Commands:")
+			g.AddMessage("  [CS] A [ALT]     - Set target altitude (e.g., DAL123 A 25000)")
+			g.AddMessage("  [CS] H [HDG]     - Set target heading (e.g., DAL123 H 270)")
+			g.AddMessage("  HO [CS]          - Handoff aircraft, scoring points")
+			g.AddMessage("  ALTCHK           - Check for aircraft at same altitude levels")
+			g.AddMessage("  HDGCHK           - Check for aircraft on similar headings")
+			g.AddMessage("Controls:")
+			g.AddMessage("  ESC                      - Pause/Resume simulation")
+			g.AddMessage("  TAB                      - Autocomplete/Cycle callsigns and commands")
+			g.AddMessage("  Arrow Up/Down            - Cycle through command history")
+			g.AddMessage("  + / -                    - Adjust simulation speed")
+			g.AddMessage("  Ctrl+D                   - Toggle debug info")
+			g.AddMessage("  Ctrl+C                   - Quit the game")
+			g.AddMessage("Goal: Guide aircraft out of your airspace (borders) without conflicts.")
+			g.AddMessage("Conflicts: Occur when two aircraft are too close laterally AND vertically.")
+			g.AddMessage("Predicted Conflicts: Show potential future conflicts based on current trajectories.")
+			g.AddMessage("--- END HELP ---")
+			return
+
+		case "EXIT":
+			g.gameRunning = false
+			return
+
+		}
+	}
+
+	// Handle 2-part commands like "HO [CALLSIGN]"
+	if len(parts) == 2 {
+		action, callsign := parts[0], parts[1]
+		if action == "HO" {
+			plane := g.FindAircraftByIdentifier(callsign)
+			if plane == nil {
+				g.AddMessage(fmt.Sprintf("Flight %s not found for handoff.", parts[1]))
+				return
+			}
+
+			// Remove the aircraft from the list
+			var newAircraftList []*Aircraft
+			for _, p := range g.aircraftList {
+				if p.Callsign != plane.Callsign {
+					newAircraftList = append(newAircraftList, p)
+				}
+			}
+			g.aircraftList = newAircraftList
+
+			g.score += 10 // Same score as a successful exit
+			g.AddMessage(fmt.Sprintf("%s handed off. Score +10", callsign))
+			return
+		}
+	}
+
 	if len(parts) != 3 {
-		g.AddMessage("Invalid command. Use: [CALLSIGN] [A/H] [VALUE]")
+		g.AddMessage("Invalid command. Use HELP for a list of commands.")
 		return
 	}
 
-	callsign, action, valueStr := parts[0], parts[1], parts[2]
-	plane := g.FindAircraft(callsign)
+	identifier, action, valueStr := parts[0], parts[1], parts[2]
+	plane := g.FindAircraftByIdentifier(identifier)
 	if plane == nil {
-		g.AddMessage(fmt.Sprintf("Flight %s not found.", callsign))
+		g.AddMessage(fmt.Sprintf("Flight %s not found.", identifier))
 		return
 	}
 
@@ -635,19 +850,56 @@ func (g *Game) ProcessCommand() {
 		}
 		plane.TargetAltitude = value
 		plane.commandAckTime = 2.0 // Flash for 2 seconds
-		g.AddMessage(fmt.Sprintf("%s, new altitude %.0f", callsign, value))
+		plane.addCommandToHistory(fmt.Sprintf("ALT %.0f", value))
+		g.AddMessage(fmt.Sprintf("%s, new altitude %.0f", plane.Callsign, value))
 	case "H": // Heading
-		hdg := int(value)
+		hdg := value
 		if hdg < 0 || hdg > 359 {
 			g.AddMessage(fmt.Sprintf("Hdg must be 0-359"))
 			return
 		}
 		plane.TargetHeading = hdg
 		plane.commandAckTime = 2.0 // Flash for 2 seconds
-		g.AddMessage(fmt.Sprintf("%s, new heading %d°", callsign, hdg))
+		plane.addCommandToHistory(fmt.Sprintf("HDG %.0f°", hdg))
+		g.AddMessage(fmt.Sprintf("%s, new heading %.0f°", plane.Callsign, hdg))
 	default:
 		g.AddMessage("Invalid action. Use 'A' (Altitude) or 'H' (Heading).")
 	}
+}
+
+// handleUICommand is called when the user presses Enter in the UI.
+func (g *Game) handleUICommand() {
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+
+	command := g.commandInput
+	// Add to command history if it's not empty and not a duplicate of the last one
+	if command != "" && (len(g.commandHistory) == 0 || g.commandHistory[len(g.commandHistory)-1] != command) {
+		g.commandHistory = append(g.commandHistory, command)
+	}
+	g.tabCompletionPrefix = ""             // Clear tab prefix on command entry
+	g.tabCompletionStartedEmpty = false    // Clear tab state on command entry
+	g.selectedAircraftCallsign = ""        // Clear selection on command entry
+	g.historyIndex = len(g.commandHistory) // Reset history index
+	g.commandInput = ""                    // Clear input buffer
+	g.ProcessCommand(command)
+}
+
+// handlePauseMenu processes input from the pause menu.
+func (g *Game) handlePauseMenu() {
+	switch g.pauseMenuSelection {
+	case 0: // Resume
+		g.state = StatePlaying
+		g.AddMessage("Simulation RESUMED.")
+	case 1: // Restart
+		g.state = StateMenu
+		g.menuSelection = 0 // Reset main menu selection
+	case 2: // Quit
+		g.gameRunning = false
+	}
+	g.tabCompletionStartedEmpty = false
+	g.tabCompletionPrefix = ""
+	g.selectedAircraftCallsign = ""
 }
 
 // --- Main Loops (Input, Update, Render) ---
@@ -699,14 +951,40 @@ func (g *Game) HandleInput() {
 			// --- State-based Input Handling ---
 			switch g.state {
 			case StateMenu:
+				numSettings := 3              // maxAircraft, spawnRate, baseSpeed
+				numOptions := numSettings + 2 // settings + Start + Quit
 				switch ev.Key() {
 				case tcell.KeyUp:
-					g.menuSelection = (g.menuSelection - 1 + len(difficulties)) % len(difficulties)
+					g.menuSelection = (g.menuSelection - 1 + numOptions) % numOptions
 				case tcell.KeyDown:
-					g.menuSelection = (g.menuSelection + 1) % len(difficulties)
+					g.menuSelection = (g.menuSelection + 1) % numOptions
+				case tcell.KeyLeft:
+					switch g.menuSelection {
+					case 0: // Max Aircraft
+						if g.maxAircraftSetting > 1 {
+							g.maxAircraftSetting--
+						}
+					case 1: // Spawn Rate
+						g.spawnRateSetting = math.Max(0.1, g.spawnRateSetting-0.1)
+					case 2: // Base Speed
+						g.baseSpeedSetting = math.Max(0.01, g.baseSpeedSetting-0.01)
+					}
+				case tcell.KeyRight:
+					switch g.menuSelection {
+					case 0: // Max Aircraft
+						g.maxAircraftSetting++
+					case 1: // Spawn Rate
+						g.spawnRateSetting += 0.1
+					case 2: // Base Speed
+						g.baseSpeedSetting += 0.01
+					}
 				case tcell.KeyEnter:
-					g.difficulty = difficulties[g.menuSelection]
-					g.Reset() // This also sets state to StatePlaying
+					if g.menuSelection == numSettings { // Start Game
+						g.state = StatePlaying
+						g.Reset()
+					} else if g.menuSelection == numSettings+1 { // Quit
+						g.gameRunning = false
+					}
 				}
 				g.Render()
 				continue
@@ -726,36 +1004,144 @@ func (g *Game) HandleInput() {
 				g.Render()
 				continue
 
+			case StateGameOverPending:
+				// Disable all input except for quitting during the grace period
+				// Ctrl+C and Ctrl+D are handled globally above.
+				continue
+
 			case StatePlaying, StatePaused:
 				if ev.Key() == tcell.KeyEscape {
 					if g.state == StatePlaying {
+						g.pauseMenuSelection = 0 // Default to Resume
 						g.state = StatePaused
-						g.AddMessage("Simulation PAUSED. Press 'ESC' again to resume.")
 					} else {
-						g.state = StatePaused
+						// In pause menu, ESC resumes
 						g.state = StatePlaying
-						g.AddMessage("Simulation RESUMED.")
 					}
 					g.Render()
 					continue
 				}
-			}
 
-			// --- Normal Game Input ---
+				if g.state == StatePaused {
+					switch ev.Key() {
+					case tcell.KeyUp:
+						g.pauseMenuSelection = (g.pauseMenuSelection - 1 + 3) % 3
+					case tcell.KeyDown:
+						g.pauseMenuSelection = (g.pauseMenuSelection + 1) % 3
+					case tcell.KeyEnter:
+						g.handlePauseMenu()
+					}
+					g.Render()
+					continue
+				}
+
+				// Update selection based on current input
+				g.mutex.Lock()
+				callsignPart := strings.Split(g.commandInput, " ")[0]
+				g.selectedAircraftCallsign = callsignPart
+				g.mutex.Unlock()
+
+				// --- Command History and Completion ---
+				if ev.Key() == tcell.KeyUp {
+					g.mutex.Lock()
+					if len(g.commandHistory) > 0 {
+						if g.historyIndex > 0 {
+							g.historyIndex--
+						}
+						g.commandInput = g.commandHistory[g.historyIndex]
+						g.tabCompletionPrefix = ""          // Clear tab prefix
+						g.tabCompletionStartedEmpty = false // Clear tab state
+						g.selectedAircraftCallsign = ""     // Clear selection when using history
+					}
+					g.mutex.Unlock()
+					continue
+				}
+				if ev.Key() == tcell.KeyDown {
+					g.mutex.Lock()
+					if g.historyIndex != -1 && g.historyIndex < len(g.commandHistory)-1 {
+						g.historyIndex++
+						g.commandInput = g.commandHistory[g.historyIndex]
+					} else if g.historyIndex == len(g.commandHistory)-1 {
+						g.historyIndex = len(g.commandHistory) // Go to a "new" command
+						g.commandInput = ""
+						g.tabCompletionPrefix = ""          // Clear tab prefix
+						g.tabCompletionStartedEmpty = false // Clear tab state
+						g.selectedAircraftCallsign = ""     // Clear selection
+					}
+					g.mutex.Unlock()
+					continue
+				}
+				if ev.Key() == tcell.KeyTab {
+					g.mutex.Lock()
+
+					hasSpace := strings.Contains(g.commandInput, " ")
+					parts := strings.Fields(g.commandInput)
+
+					// --- Stage 2: Cycle Commands (A, H) ---
+					// This happens if there's a space and the callsign is valid.
+					if hasSpace && len(parts) > 0 && g.FindAircraft(parts[0]) != nil {
+						callsign := parts[0]
+						if len(parts) == 1 { // e.g., "DAL123 "
+							g.commandInput = callsign + " A "
+						} else if parts[1] == "A" {
+							g.commandInput = callsign + " H "
+						} else if parts[1] == "H" {
+							g.commandInput = callsign + " " // Cycle back to just callsign + space
+						}
+					} else {
+						// --- Stage 1: Cycle Callsigns ---
+						// This happens if there's no space in the input.
+
+						// If this is the first time pressing tab for this command, store the state.
+						if g.tabCompletionPrefix == "" {
+							if g.commandInput == "" {
+								g.tabCompletionStartedEmpty = true
+							}
+							g.tabCompletionPrefix = strings.ToUpper(g.commandInput) // This will be "" if input was empty
+						}
+
+						var matches []string
+						for _, ac := range g.aircraftList {
+							if g.tabCompletionPrefix == "" || strings.HasPrefix(ac.Callsign, g.tabCompletionPrefix) {
+								matches = append(matches, ac.Callsign)
+							}
+						}
+
+						if len(matches) > 0 {
+							currentIndex := -1
+							var currentInputUpper string
+							// If we started with an empty input, the "current" input is the one we just completed.
+							// Otherwise, it's whatever is in the text box.
+							currentInputUpper = strings.ToUpper(g.commandInput)
+
+							// Find where the current input is in the list of matches.
+							for i, match := range matches {
+								if match == currentInputUpper && g.FindAircraft(currentInputUpper) != nil {
+									currentIndex = i
+									break
+								}
+							}
+
+							// Move to the next index, wrapping around.
+							nextIndex := (currentIndex + 1) % len(matches)
+							g.commandInput = matches[nextIndex]
+							g.selectedAircraftCallsign = g.commandInput
+						}
+					}
+					g.mutex.Unlock()
+					continue
+				}
+			}
 
 			if ev.Key() == tcell.KeyEnter {
-				g.ProcessCommand()
+				g.handleUICommand()
 				continue
-			}
-			if ev.Key() == tcell.KeyRune && (ev.Rune() == 'q' || ev.Rune() == 'Q') && len(g.commandInput) == 0 {
-				// Allow 'q' to quit if input is empty
-				g.gameRunning = false
-				g.AddMessage("Quit command received.")
-				return
 			}
 			if ev.Key() == tcell.KeyBackspace || ev.Key() == tcell.KeyBackspace2 {
 				if len(g.commandInput) > 0 {
 					g.commandInput = g.commandInput[:len(g.commandInput)-1]
+					g.tabCompletionStartedEmpty = false // Clear tab state
+					g.tabCompletionPrefix = ""          // Clear tab prefix
 				}
 				continue
 			}
@@ -774,7 +1160,17 @@ func (g *Game) HandleInput() {
 						g.AddMessage(fmt.Sprintf("Game speed set to %.1fx", g.speedMultiplier))
 					}
 				default:
-					g.commandInput += string(r)
+					g.tabCompletionPrefix = "" // Clear tab prefix when typing a character
+					g.tabCompletionStartedEmpty = false
+					// Add a space, but only if there isn't one already and input is not empty
+					if r == ' ' {
+						// Allow space if input is not empty and doesn't already end with a space
+						if len(g.commandInput) > 0 && !strings.HasSuffix(g.commandInput, " ") {
+							g.commandInput += " "
+						}
+					} else {
+						g.commandInput += string(r)
+					}
 				}
 				g.mutex.Unlock()
 			}
@@ -811,21 +1207,35 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 	// --- State-based Rendering ---
 	switch g.state {
 	case StateMenu:
-		title := "--- GO ATC SIMULATOR ---"
+		title := "--- ATC SIMULATOR - SETTINGS ---"
 		DrawText(g.screen, w/2-len(title)/2, h/2-5, title, styleHeader)
-		prompt := "Select Difficulty:"
-		DrawText(g.screen, w/2-len(prompt)/2, h/2-3, prompt, styleDefault)
 
-		for i, d := range difficulties {
+		// Settings
+		settings := []string{
+			fmt.Sprintf("Max Aircraft : < %2d >", g.maxAircraftSetting),
+			fmt.Sprintf("Spawn Rate   : < %4.2f >", g.spawnRateSetting),
+			fmt.Sprintf("Base Speed   : < %5.3f >", g.baseSpeedSetting),
+		}
+		for i, s := range settings {
 			style := styleDefault
-			msg := fmt.Sprintf("  %s  ", d.Name)
 			if i == g.menuSelection {
 				style = styleInput
-				msg = fmt.Sprintf("> %s <", d.Name)
 			}
-			DrawText(g.screen, w/2-len(msg)/2, h/2-1+i, msg, style)
+			DrawText(g.screen, w/2-len(s)/2, h/2-2+i, s, style)
 		}
-		DrawText(g.screen, w/2-len("Use Arrow Keys and Enter")/2, h/2+3, "Use Arrow Keys and Enter", styleLog)
+
+		// Options
+		options := []string{"Start Game", "Quit"}
+		for i, o := range options {
+			style := styleDefault
+			msg := fmt.Sprintf("  %s  ", o)
+			if i+len(settings) == g.menuSelection {
+				style = styleInput
+				msg = fmt.Sprintf("> %s <", o)
+			}
+			DrawText(g.screen, w/2-len(msg)/2, h/2+2+i, msg, style)
+		}
+		DrawText(g.screen, w/2-len("Use Arrows to change values, Enter to select")/2, h/2+5, "Use Arrows to change values, Enter to select", styleLog)
 
 		g.screen.Show()
 		return
@@ -844,8 +1254,13 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 			quitStyle = styleInput
 		}
 
-		restartMsg := "> RESTART <"
-		quitMsg := "  QUIT   "
+		restartMsg := " RESTART "
+		quitMsg := "  QUIT  "
+		if g.menuSelection == 0 {
+			restartMsg = "> RESTART <"
+		} else {
+			quitMsg = ">  QUIT  <"
+		}
 		DrawText(g.screen, w/2-len(restartMsg)/2, h/2, restartMsg, restartStyle)
 		DrawText(g.screen, w/2-len(quitMsg)/2, h/2+1, quitMsg, quitStyle)
 
@@ -855,8 +1270,8 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 	// For StatePlaying and StatePaused, we draw the main game screen.
 
 	// 1. Draw Headers
-	DrawText(g.screen, 1, 0, "--- GO ATC SIMULATOR (v1.7) ---", styleHeader)
-	header := fmt.Sprintf("SCORE:%-5d|CONFLICTS:%d/%d|AC:%-2d/%-2d|DIFF:%s", g.score, g.conflicts, GameOverConflict, len(g.aircraftList), g.difficulty.MaxAircraft, g.difficulty.Name)
+	DrawText(g.screen, 1, 0, "--- ATC SIMULATOR ---", styleHeader)
+	header := fmt.Sprintf("SCORE:%-5d|CONFLICTS:%d/%d|AC:%-2d/%-2d", g.score, g.conflicts, GameOverConflict, len(g.aircraftList), g.maxAircraftSetting)
 	DrawText(g.screen, g.airspaceWidth+3, 0, header, styleInput)
 
 	// 2. Draw Airspace Borders (with conflict flash)
@@ -877,6 +1292,34 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 	g.screen.SetContent(g.airspaceWidth-1, 1, tcell.RuneURCorner, nil, currentBorderStyle)
 	g.screen.SetContent(0, g.airspaceHeight, tcell.RuneLLCorner, nil, currentBorderStyle)
 	g.screen.SetContent(g.airspaceWidth-1, g.airspaceHeight, tcell.RuneLRCorner, nil, currentBorderStyle)
+
+	// 2b. Draw projected path for selected aircraft
+	if g.selectedAircraftCallsign != "" {
+		// Use FindAircraftByIdentifier to allow selection by 'a' or 'DAL123'
+		if plane := g.FindAircraftByIdentifier(strings.ToUpper(g.selectedAircraftCallsign)); plane != nil {
+			// Draw current trajectory
+			projectionTime := 120.0 // 2 minutes
+			endX := plane.X + plane.dx*g.baseSpeedSetting*projectionTime
+			endY := plane.Y + plane.dy*g.baseSpeedSetting*projectionTime
+			DrawLine(g.screen, int(plane.X), int(plane.Y), int(endX), int(endY), '.', styleLog)
+
+			// Check if a new heading command is being typed and draw a preview trajectory
+			parts := strings.Fields(g.commandInput)
+			if len(parts) == 3 && strings.ToUpper(parts[1]) == "H" {
+				// Ensure the command is for the currently selected plane
+				if strings.ToUpper(parts[0]) == strings.ToUpper(plane.Callsign) || strings.ToUpper(parts[0]) == string(plane.ID) {
+					newHeading, err := strconv.ParseFloat(parts[2], 64)
+					if err == nil && newHeading >= 0 && newHeading <= 359 {
+						// This is a valid heading command in progress, draw the preview
+						newVec := headingToVector(int(newHeading))
+						previewEndX := plane.X + newVec.X*g.baseSpeedSetting*projectionTime
+						previewEndY := plane.Y + newVec.Y*g.baseSpeedSetting*projectionTime
+						DrawLine(g.screen, int(plane.X), int(plane.Y), int(previewEndX), int(previewEndY), '.', styleWarning)
+					}
+				}
+			}
+		}
+	}
 
 	// 3. Draw Aircraft
 	// 3a. Draw CPA lines first, so they are underneath aircraft blips
@@ -927,8 +1370,31 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 	y++
 	for _, plane := range g.aircraftList {
 		line, style := plane.GetStatusLine()
+		// Highlight if selected via tab or if the typed identifier matches
+		selectedPlane := g.FindAircraftByIdentifier(strings.ToUpper(g.selectedAircraftCallsign))
+		if selectedPlane != nil && plane.Callsign == selectedPlane.Callsign {
+			style = styleSelected
+		} else if plane.IsCommandAck() {
+			style = styleCommandAck
+		}
 		DrawText(g.screen, g.airspaceWidth+3, y, line, style)
 		y++
+	}
+
+	// Draw command history for selected aircraft
+	if g.selectedAircraftCallsign != "" {
+		// Use FindAircraftByIdentifier to show history when 'a' is typed
+		if plane := g.FindAircraftByIdentifier(strings.ToUpper(g.selectedAircraftCallsign)); plane != nil && len(plane.commandHistory) > 0 {
+			y++ // Spacer
+			header := fmt.Sprintf("--- CMD HISTORY: %s ---", plane.Callsign)
+			DrawText(g.screen, g.airspaceWidth+3, y, header, styleHeader)
+			y++
+			// Show last 5 commands
+			for _, cmd := range plane.commandHistory {
+				DrawText(g.screen, g.airspaceWidth+3, y, "  - "+cmd, styleLog)
+				y++
+			}
+		}
 	}
 
 	// 5. Draw Message Log (below airspace)
@@ -949,8 +1415,8 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 
 	// 7. Draw Instructions
 	y += 2
-	DrawText(g.screen, 1, y, "CMDS: [CALLSIGN] [A/H] [VALUE] | 'ESC' to Pause | 'Ctrl+D' for Debug", styleDefault)
-	DrawText(g.screen, 1, y+1, "Type 'Q' (in empty cmd) or 'CtrlC' to quit. | Use '+' and '-' to change speed.", styleDefault)
+	DrawText(g.screen, 1, y, "CMDS: [CS] [A/H] [VAL] | HO [CS] | ALTCHK | HDGCHK | 'ESC' to Pause | 'Ctrl+D' for Debug", styleDefault)
+	DrawText(g.screen, 1, y+1, "Use 'Ctrl+C' to quit. | Use '+' and '-' to change speed.", styleDefault)
 
 	// 8. Draw Speed
 	speedStr := fmt.Sprintf("SPEED: %.1fx", g.speedMultiplier)
@@ -958,8 +1424,31 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 
 	// 9. Draw PAUSED overlay
 	if g.state == StatePaused {
-		msg := " PAUSED "
-		DrawText(g.screen, g.airspaceWidth/2-len(msg)/2, g.airspaceHeight/2, msg, stylePaused)
+		boxW, boxH := 20, 7
+		boxX, boxY := g.airspaceWidth/2-boxW/2, g.airspaceHeight/2-boxH/2
+		for y := boxY; y < boxY+boxH; y++ {
+			for x := boxX; x < boxX+boxW; x++ {
+				g.screen.SetContent(x, y, ' ', nil, stylePaused)
+			}
+		}
+		DrawText(g.screen, boxX+boxW/2-len("PAUSED")/2, boxY+1, "PAUSED", stylePaused)
+
+		options := []string{"Resume", "Restart", "Quit"}
+		for i, opt := range options {
+			style := stylePaused
+			msg := fmt.Sprintf("  %s  ", opt)
+			if i == g.pauseMenuSelection {
+				style = stylePaused.Reverse(true)
+				msg = fmt.Sprintf("> %s <", opt)
+			}
+			DrawText(g.screen, boxX+boxW/2-len(msg)/2, boxY+3+i, msg, style)
+		}
+	}
+
+	// Draw GAME OVER IMMINENT overlay
+	if g.state == StateGameOverPending {
+		msg := " !!! GAME OVER IMMINENT !!! "
+		DrawText(g.screen, g.airspaceWidth/2-len(msg)/2, g.airspaceHeight/2, msg, styleConflict)
 	}
 
 	// 10. Draw DEBUG overlay
@@ -977,39 +1466,96 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 
 // DrawLine uses Bresenham's line algorithm to draw a line between two points
 func DrawLine(s tcell.Screen, x1, y1, x2, y2 int, r rune, style tcell.Style) {
+	// Use local variables for iteration to avoid modifying the original parameters.
+	x, y := x1, y1
 	dx := math.Abs(float64(x2 - x1))
 	dy := -math.Abs(float64(y2 - y1))
 	sx, sy := 1, 1
-	if x1 > x2 {
+	if x > x2 {
 		sx = -1
 	}
-	if y1 > y2 {
+	if y > y2 {
 		sy = -1
 	}
 	err := dx + dy
 
 	for {
 		// Don't draw over the start and end points
-		if (x1 != x2 || y1 != y2) && (x1 != x1 || y1 != y1) {
-			s.SetContent(x1, y1, r, nil, style)
+		if (x != x2 || y != y2) && (x != x1 || y != y1) {
+			s.SetContent(x, y, r, nil, style)
 		}
-		if x1 == x2 && y1 == y2 {
+		if x == x2 && y == y2 {
 			break
 		}
 		e2 := 2 * err
 		if e2 >= dy {
 			err += dy
-			x1 += sx
+			x += sx
 		}
 		if e2 <= dx {
 			err += dx
-			y1 += sy
+			y += sy
 		}
 	}
 }
 
+// --- API Server ---
+
+// ApiGameState is the structure for the JSON state representation.
+type ApiGameState struct {
+	Score      int         `json:"score"`
+	Conflicts  int         `json:"conflicts"`
+	IsGameOver bool        `json:"is_game_over"`
+	Aircraft   []*Aircraft `json:"aircraft"`
+}
+
+// CommandRequest is the structure for receiving a command via the API.
+type CommandRequest struct {
+	Command string `json:"command"`
+}
+
+func (g *Game) stateHandler(w http.ResponseWriter, r *http.Request) {
+	g.mutex.Lock()
+	defer g.mutex.Unlock()
+
+	state := ApiGameState{
+		Score:      g.score,
+		Conflicts:  g.conflicts,
+		IsGameOver: g.state == StateGameOver || g.state == StateGameOverPending,
+		Aircraft:   g.aircraftList,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(state)
+}
+
+func (g *Game) commandHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req CommandRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	g.mutex.Lock()
+	g.ProcessCommand(req.Command)
+	g.mutex.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Command received: %s", req.Command)
+}
+
 // --- Main Function ---
 func main() {
+	apiEnabled := false
+	if len(os.Args) > 1 && os.Args[1] == "-api" {
+		apiEnabled = true
+	}
+
 	s, err := tcell.NewScreen()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create screen: %v", err)
@@ -1021,8 +1567,17 @@ func main() {
 	}
 	s.SetStyle(styleDefault)
 
-	game := NewGame(s)
+	game := NewGame(s, apiEnabled)
 	defer s.Fini()
+
+	if apiEnabled {
+		http.HandleFunc("/state", game.stateHandler)
+		http.HandleFunc("/command", game.commandHandler)
+		go func() {
+			fmt.Println("API server starting on :8080")
+			http.ListenAndServe(":8080", nil)
+		}()
+	}
 
 	// This outer loop allows for restarting the game.
 	// The inner `game.Run()` will exit when gameRunning is false.
