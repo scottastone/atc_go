@@ -299,9 +299,10 @@ type Game struct {
 	actionChan                chan string
 	apiEnabled                bool
 	// Settings
-	maxAircraftSetting int
-	spawnRateSetting   float64
-	baseSpeedSetting   float64
+	maxAircraftSetting           int
+	spawnRateSetting             float64
+	baseSpeedSetting             float64
+	flowTrafficProportionSetting float64
 } // Added closing brace
 
 var airlineCodes = []string{"ACA", "DAL", "UAL", "AAL", "SWA", "BAW", "AFR", "KLM", "JAL", "DLH", "QFA"}
@@ -363,9 +364,10 @@ func NewGame(s tcell.Screen, apiEnabled bool) *Game {
 		actionChan:                make(chan string, 1),
 		apiEnabled:                apiEnabled,
 		// Default settings (Normal)
-		maxAircraftSetting: 15,
-		spawnRateSetting:   1.0,
-		baseSpeedSetting:   0.125,
+		maxAircraftSetting:           15,
+		spawnRateSetting:             1.0,
+		baseSpeedSetting:             0.125,
+		flowTrafficProportionSetting: 0.7, // 70% of traffic will be in a predictable flow
 	}
 	g.updateScreenSize() // Set initial size
 	return g
@@ -459,14 +461,21 @@ func (g *Game) tryGenerateAircraft() bool {
 	}
 
 	// Give it a new random target heading and altitude to create action
-	var newTargetHeading float64
-	if g.r.Float64() < 0.5 {
-		// 50% chance to fly straight initially
-		newTargetHeading = float64(heading)
+	var targetHeading float64
+	// Check if this aircraft should be part of a predictable flow
+	if g.r.Float64() < g.flowTrafficProportionSetting {
+		// Flow traffic: Set heading to cross the airspace
+		targetHeading = float64(heading)
 	} else {
-		// 50% chance to get a new heading
-		newTargetHeading = float64(g.r.Intn(360))
+		// Random traffic: Give a random new heading
+		targetHeading = float64(g.r.Intn(360))
 	}
+
+	// The initial heading is always straight in from the edge.
+	// The target heading determines its flight plan.
+	initialHeading := float64(heading)
+	// For flow traffic, we want it to fly straight across, so initial and target are the same.
+	// For random traffic, we'll let it turn to its random target heading.
 
 	newTargetAltitude := g.getRandomAltitude()
 	// Ensure new altitude is different
@@ -483,11 +492,11 @@ func (g *Game) tryGenerateAircraft() bool {
 		g.nextAircraftID = 'a' // Skip over symbols between '9' and 'a'
 	}
 
-	newPlane := NewAircraft(id, callsign, x, y, altitude, float64(heading), newTargetHeading, newTargetAltitude)
+	newPlane := NewAircraft(id, callsign, x, y, altitude, initialHeading, targetHeading, newTargetAltitude)
 
 	g.aircraftList = append(g.aircraftList, newPlane)
-	g.AddMessage(fmt.Sprintf("New(%c): %s, Hdg %d° Alt %.0f, Tgt Hdg %.0f° Tgt Alt %.0f",
-		id, callsign, heading, altitude, newTargetHeading, newTargetAltitude))
+	g.AddMessage(fmt.Sprintf("New(%c): %s, Hdg %.0f° Alt %.0f, Tgt Hdg %.0f° Tgt Alt %.0f",
+		id, callsign, initialHeading, altitude, targetHeading, newTargetAltitude))
 	return true
 }
 
@@ -952,7 +961,7 @@ func (g *Game) HandleInput() {
 			// --- State-based Input Handling ---
 			switch g.state {
 			case StateMenu:
-				numSettings := 3              // maxAircraft, spawnRate, baseSpeed
+				numSettings := 4              // maxAircraft, spawnRate, baseSpeed, flowTraffic
 				numOptions := numSettings + 2 // settings + Start + Quit
 				switch ev.Key() {
 				case tcell.KeyUp:
@@ -969,6 +978,8 @@ func (g *Game) HandleInput() {
 						g.spawnRateSetting = math.Max(0.1, g.spawnRateSetting-0.1)
 					case 2: // Base Speed
 						g.baseSpeedSetting = math.Max(0.01, g.baseSpeedSetting-0.01)
+					case 3: // Flow Traffic Proportion
+						g.flowTrafficProportionSetting = math.Max(0.0, g.flowTrafficProportionSetting-0.1)
 					}
 				case tcell.KeyRight:
 					switch g.menuSelection {
@@ -978,6 +989,8 @@ func (g *Game) HandleInput() {
 						g.spawnRateSetting += 0.1
 					case 2: // Base Speed
 						g.baseSpeedSetting += 0.01
+					case 3: // Flow Traffic Proportion
+						g.flowTrafficProportionSetting = math.Min(1.0, g.flowTrafficProportionSetting+0.1)
 					}
 				case tcell.KeyEnter:
 					if g.menuSelection == numSettings { // Start Game
@@ -1216,6 +1229,7 @@ func (g *Game) Render() { // Fixed: Changed from (g) to (g *Game)
 			fmt.Sprintf("Max Aircraft : < %2d >", g.maxAircraftSetting),
 			fmt.Sprintf("Spawn Rate   : < %4.2f >", g.spawnRateSetting),
 			fmt.Sprintf("Base Speed   : < %5.3f >", g.baseSpeedSetting),
+			fmt.Sprintf("Flow Traffic : < %4.2f >", g.flowTrafficProportionSetting),
 		}
 		for i, s := range settings {
 			style := styleDefault
@@ -1555,6 +1569,7 @@ type GameConfig struct {
 	MaxAircraft int     `json:"max_aircraft"`
 	SpawnRate   float64 `json:"spawn_rate"`
 	BaseSpeed   float64 `json:"base_speed"`
+	FlowTraffic float64 `json:"flow_traffic_proportion"`
 }
 
 // loadConfig reads a JSON file and returns a GameConfig struct.
@@ -1606,6 +1621,7 @@ func main() {
 			game.maxAircraftSetting = config.MaxAircraft
 			game.spawnRateSetting = config.SpawnRate
 			game.baseSpeedSetting = config.BaseSpeed
+			game.flowTrafficProportionSetting = config.FlowTraffic
 			fmt.Printf("Loaded settings from %s\n", configFile)
 		}
 	}

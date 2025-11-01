@@ -67,7 +67,8 @@ A sample configuration file (`config.sample.json`) is included in the repository
 {
   "max_aircraft": 15,
   "spawn_rate": 1.0,
-  "base_speed": 0.125
+  "base_speed": 0.125,
+  "flow_traffic_proportion": 0.7
 }
 ```
 
