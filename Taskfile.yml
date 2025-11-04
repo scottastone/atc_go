@@ -1,0 +1,43 @@
+version: '3'
+
+vars:
+  OUTPUT_DIR: 'dist'
+  BINARY_NAME: 'atc'
+  OUTPUT_PATH: '{{.OUTPUT_DIR}}/{{.BINARY_NAME}}'
+
+tasks:
+  default:
+    cmds:
+      - task build
+
+  clean:
+    desc: "Cleans up previous build artifacts."
+    cmds:
+      - echo "Cleaning up old build directory..."
+      - rm -rf {{.OUTPUT_DIR}}
+      - mkdir -p {{.OUTPUT_DIR}}
+
+  build:
+    desc: "Builds and strips the Go application."
+    deps:
+      - clean # Ensures 'clean' runs before 'build'
+    cmds:
+      - echo "Building and stripping the executable..."
+      # The Go build command remains the same
+      - go build -ldflags="-s -w" -o {{.OUTPUT_PATH}} .
+    # This runs the 'report' task immediately after 'build' succeeds
+    # Task automatically handles the success/failure of 'go build'
+    silent: true # Suppresses Task's command echoes
+    
+  report:
+    desc: "Reports the successful build location and file size."
+    cmds:
+      # Use an inline bash command to get the file size
+      - |
+        FILE_SIZE=$(du -h {{.OUTPUT_PATH}} | awk '{print $1}')
+        echo -e "\n\033[0;32mBuild successful!\033[0m"
+        echo "Executable created at: {{.OUTPUT_PATH}}"
+        echo "File size: $FILE_SIZE"
+
+# The 'build' task could be modified to execute the 'report' as a dependency 
+# or directly after the build command. The structure above is very clear.
